@@ -1,0 +1,14 @@
+{
+  "ips": [
+  ],
+  "domains": [
+  ],
+  "ca": {
+    "country": "CN",
+    "province": "爱所有人",
+    "organization": "爱所有人",
+    "organizationalUnit": "爱所有人",
+    "commonName": "爱所有人",
+    "validityYears": 100
+  }
+}

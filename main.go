@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	RSABitsSize        = 2048
+	RSABitsSize        = 4096
 	CACertFilename     = "build/ca.pem"
 	CAKeyFilename      = "build/ca.key"
 	ServerCertFilename = "build/server.pem"

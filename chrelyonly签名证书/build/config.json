@@ -1,0 +1,14 @@
+{
+  "ips": [],
+  "domains": [
+    "cn.chrelyonly.music"
+  ],
+  "ca": {
+    "country": "CN",
+    "province": "Yunnan",
+    "organization": "chrelyonly",
+    "organizationalUnit": "chrelyonly",
+    "commonName": "chrelyonly CA",
+    "validityYears": 100
+  }
+}
