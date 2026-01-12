@@ -1,7 +1,7 @@
 {
-  "ips": [],
+  "ips": [
+  ],
   "domains": [
-    "cn.chrelyonly.music"
   ],
   "ca": {
     "country": "CN",

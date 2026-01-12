@@ -1,0 +1,148 @@
+# ================================
+# 工作流名称（Actions 页面显示）
+# ================================
+name: 打包
+
+# ================================
+# 触发条件
+# ================================
+# 手动触发
+#on:
+#  workflow_dispatch:
+#tag打包
+on:
+  push:
+    tags:
+      - '*'   # 监听所有 tag
+
+
+# ================================
+# 全局环境变量
+# ================================
+env:
+  APP_NAME: my-ssl   # 程序名
+  GO_VERSION: "1.25.5"          # Go 版本
+  DIST_DIR: dist              # 构建输出目录
+
+jobs:
+  build:
+    # Job 名称
+    name: 打包 ${{ matrix.goos }}-${{ matrix.goarch }}
+
+    # 使用 Linux runner 做交叉编译
+    runs-on: ubuntu-latest
+
+    # 构建矩阵
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [windows, linux, darwin]
+        goarch: [amd64, arm64]
+
+    steps:
+      # ================================
+      # 拉取代码
+      # ================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================
+      # 安装 Go
+      # ================================
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # ================================
+      # 编译 Go 程序
+      # ================================
+      - name: 打包二进制
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p "$DIST_DIR"
+
+          # Windows 自动加 .exe
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then
+            EXT=".exe"
+          fi
+
+          OUTPUT_NAME="${APP_NAME}-${GOOS}-${GOARCH}${EXT}"
+          echo "➡️ 开始构建: $OUTPUT_NAME"
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "$DIST_DIR/$OUTPUT_NAME"
+
+      # ================================
+      # 打包发布文件
+      # Windows -> zip
+      # Linux / macOS -> tar.gz
+      # 同时包含证书文件
+      # ================================
+      - name: 压缩文件
+        run: |
+          cd "$DIST_DIR"
+
+          BASE_NAME="${APP_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          PACKAGE_DIR="${BASE_NAME}_package"
+
+          # 创建打包目录（避免与二进制同名冲突）
+          mkdir -p "$PACKAGE_DIR"
+
+          # 拷贝可执行文件
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cp "${BASE_NAME}.exe" "$PACKAGE_DIR/"
+          else
+            cp "${BASE_NAME}" "$PACKAGE_DIR/"
+          fi
+
+          mkdir -p "$PACKAGE_DIR/build"
+          # 拷贝证书文件（来自仓库根目录）
+          cp ../ca.key "$PACKAGE_DIR/build"
+          cp ../ca.pem "$PACKAGE_DIR/build"
+          cp ../config.json "$PACKAGE_DIR/config.json"
+
+          # 打包
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -r "${BASE_NAME}.zip" "$PACKAGE_DIR"
+          else
+            tar -czf "${BASE_NAME}.tar.gz" "$PACKAGE_DIR"
+          fi
+
+      # ================================
+      # 上传构建产物
+      # ================================
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+#保存发布到Release
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}      # 使用 push 的 tag
+          name: Release ${{ github.ref_name }}  # Release 名
+          files: |
+            release/**/*.zip
+            release/**/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
