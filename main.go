@@ -59,11 +59,6 @@ type GenerateRequest struct {
 	IPs      []string `json:"ips"`
 }
 
-type PresetCA struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
 // 内存中缓存的内置/本地 CA 结构
 type InternalCA struct {
 	Cert    *x509.Certificate
@@ -74,8 +69,6 @@ type InternalCA struct {
 
 var presetCAMap = make(map[string]*InternalCA)
 
-// 💡 1. 嵌入 public 文件夹（确保 main.go 同级或下级存在 public 目录）
-//
 //go:embed public/*
 var staticFS embed.FS
 
@@ -89,42 +82,38 @@ func main() {
 	// ===== 路由配置 =====
 	r.POST("/generate", handleGenerateCerts)
 
-	// ===== 2. 配置静态资源与 SPA 路由适配 =====
-
-	// 提取 staticFS 中的 public 子目录作为根目录
+	// ===== 静态资源与 SPA 路由适配 =====
 	subFS, err := fs.Sub(staticFS, "public")
 	if err != nil {
 		panic(fmt.Sprintf("初始化嵌入文件失败: %v", err))
 	}
 
-	// 代理静态文件（如 js, css, images 等）
 	httpFS := http.FS(subFS)
 
-	// 拦截未匹配的路由，返回 index.html 以支持 Vue Router 的 History 模式
 	r.NoRoute(func(c *gin.Context) {
 		path := c.Request.URL.Path
 
-		// 如果请求的是 API 或已有路由，跳过处理
 		if strings.HasPrefix(path, "/generate") {
 			return
 		}
 
-		// 检查请求的文件是否存在于 embed.FS 中
+		// 检查静态资源是否存在
 		f, err := subFS.Open(strings.TrimPrefix(path, "/"))
 		if err == nil {
 			_ = f.Close()
-			// 文件存在，交由 http.FileServer 直接渲染静态资源
 			http.FileServer(httpFS).ServeHTTP(c.Writer, c.Request)
 			return
 		}
 
-		// 文件不存在（例如 Vue 路由页面刷新，如 /dashboard），统一返回 index.html
+		// SPA 路由回退至 index.html
 		c.Request.URL.Path = "/"
 		http.FileServer(httpFS).ServeHTTP(c.Writer, c.Request)
 	})
 
 	fmt.Println("🚀 PKI 证书签发后端已启动于 :8080...")
-	r.Run(":8080")
+	if err := r.Run(":8080"); err != nil {
+		fmt.Printf("❌ 服务启动失败: %v\n", err)
+	}
 }
 
 // ===== 核心业务逻辑实现 =====
@@ -145,7 +134,7 @@ func handleGenerateCerts(c *gin.Context) {
 	if req.CAMode == "preset" {
 		preset, ok := presetCAMap[req.PresetID]
 		if !ok || preset == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("选中的预设 CA (%s) 未找到或未成功加载 template/%s 目录下的证书", req.PresetID, req.PresetID)})
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("选中的预设 CA (%s) 未找到，请检查 template/%s 目录", req.PresetID, req.PresetID)})
 			return
 		}
 		caCert = preset.Cert
@@ -153,7 +142,6 @@ func handleGenerateCerts(c *gin.Context) {
 		caCertPEM = preset.CertPEM
 		caKeyPEM = preset.KeyPEM
 	} else {
-		// 自动生成全新自签名 CA
 		caCert, caKey, caCertPEM, caKeyPEM, err = generateCustomCA(req.CA, req.KeySpec)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "自定义 CA 生成失败: " + err.Error()})
@@ -161,42 +149,54 @@ func handleGenerateCerts(c *gin.Context) {
 		}
 	}
 
-	// Step 2: 生成服务端私钥与证书（使用选定的 CA 进行签发）
+	// Step 2: 生成服务端私钥与证书
 	serverCertPEM, serverKeyPEM, err := generateServerCert(caCert, caKey, req.Domains, req.IPs, req.KeySpec)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务端证书签发失败: " + err.Error()})
 		return
 	}
 
-	// Step 3: 根据前端勾选的 Targets 组装 Zip 压缩包
+	// Step 3: 打包 ZIP
 	zipBuf := new(bytes.Buffer)
 	zipWriter := zip.NewWriter(zipBuf)
 
 	if req.Targets.CACert && caCertPEM != "" {
-		addFileToZip(zipWriter, "ca.pem", []byte(caCertPEM))
+		if err := addFileToZip(zipWriter, "ca.pem", []byte(caCertPEM)); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "打包 ca.pem 失败: " + err.Error()})
+			return
+		}
 	}
 	if req.Targets.CAKey && caKeyPEM != "" {
-		addFileToZip(zipWriter, "ca.key", []byte(caKeyPEM))
+		if err := addFileToZip(zipWriter, "ca.key", []byte(caKeyPEM)); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "打包 ca.key 失败: " + err.Error()})
+			return
+		}
 	}
 	if req.Targets.ServerCert && serverCertPEM != "" {
-		addFileToZip(zipWriter, "server.pem", []byte(serverCertPEM))
+		if err := addFileToZip(zipWriter, "server.pem", []byte(serverCertPEM)); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "打包 server.pem 失败: " + err.Error()})
+			return
+		}
 	}
 	if req.Targets.ServerKey && serverKeyPEM != "" {
-		addFileToZip(zipWriter, "server.key", []byte(serverKeyPEM))
+		if err := addFileToZip(zipWriter, "server.key", []byte(serverKeyPEM)); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "打包 server.key 失败: " + err.Error()})
+			return
+		}
 	}
 
 	if err := zipWriter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "打包 ZIP 失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "关闭 ZIP 写入流失败: " + err.Error()})
 		return
 	}
 
-	// Step 4: 返回文件流供前端下载
+	// Step 4: 返回二进制流下载
 	c.Header("Content-Disposition", "attachment; filename=certs.zip")
 	c.Header("Content-Type", "application/zip")
 	c.Data(http.StatusOK, "application/zip", zipBuf.Bytes())
 }
 
-// ===== 本地 template 目录 CA 证书文件读取加载 =====
+// ===== 本地 template 目录 CA 证书加载 =====
 
 func initPresetCAsFromTemplate() {
 	presets := []struct {
@@ -213,14 +213,12 @@ func initPresetCAsFromTemplate() {
 	}
 
 	for _, p := range presets {
-		// 读取路径类似: template/1/ca.pem 和 template/1/ca.key
 		targetDir := filepath.Join(execDir, "template", p.id)
-
 		certPath := findCertFile(targetDir)
 		keyPath := filepath.Join(targetDir, "ca.key")
 
 		if certPath == "" {
-			fmt.Printf("⚠️ 警告: 预设 CA [%s - %s] 未能找到证书文件 (%s/ca.pem)\n", p.id, p.name, targetDir)
+			fmt.Printf("⚠️ 警告: 预设 CA [%s - %s] 未找到证书文件 (%s/ca.pem)\n", p.id, p.name, targetDir)
 			continue
 		}
 
@@ -231,11 +229,10 @@ func initPresetCAsFromTemplate() {
 		}
 
 		presetCAMap[p.id] = ca
-		fmt.Printf("✅ 成功从 [%s] 加载预设 CA [%s - %s]\n", certPath, p.id, p.name)
+		fmt.Printf("✅ 成功加载预设 CA [%s - %s]\n", p.id, p.name)
 	}
 }
 
-// 寻找 template/{id} 目录下可能存在的证书文件名 (ca.pem / ca.crt / ca.cer)
 func findCertFile(dir string) string {
 	candidates := []string{"ca.pem", "ca.crt", "ca.cer"}
 	for _, name := range candidates {
@@ -247,7 +244,6 @@ func findCertFile(dir string) string {
 	return ""
 }
 
-// 从磁盘读取并解析 PEM 格式的证书和私钥
 func loadCAFromDisk(certPath, keyPath string) (*InternalCA, error) {
 	certBytes, err := os.ReadFile(certPath)
 	if err != nil {
@@ -262,17 +258,17 @@ func loadCAFromDisk(certPath, keyPath string) (*InternalCA, error) {
 	// 解析证书
 	certBlock, _ := pem.Decode(certBytes)
 	if certBlock == nil {
-		return nil, fmt.Errorf("证书 PEM 解析失败")
+		return nil, fmt.Errorf("证书 PEM 格式无效")
 	}
 	cert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("解析 x509 证书失败: %w", err)
 	}
 
-	// 解析私钥 (支持 PKCS1, PKCS8, EC)
+	// 解析私钥
 	keyBlock, _ := pem.Decode(keyBytes)
 	if keyBlock == nil {
-		return nil, fmt.Errorf("私钥 PEM 解析失败")
+		return nil, fmt.Errorf("私钥 PEM 格式无效")
 	}
 
 	var key crypto.Signer
@@ -283,7 +279,7 @@ func loadCAFromDisk(certPath, keyPath string) (*InternalCA, error) {
 	} else if parsedKey, err := x509.ParseECPrivateKey(keyBlock.Bytes); err == nil {
 		key = parsedKey
 	} else {
-		return nil, fmt.Errorf("不支持的私钥格式")
+		return nil, fmt.Errorf("不支持或无法解析的私钥格式")
 	}
 
 	return &InternalCA{
@@ -335,9 +331,11 @@ func generateCustomCA(info CAInfo, spec KeySpec) (*x509.Certificate, crypto.Sign
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Country:      []string{info.Country},
-			Organization: []string{info.Organization},
-			CommonName:   info.CommonName,
+			Country:            []string{info.Country},
+			Province:           []string{info.Province},
+			Organization:       []string{info.Organization},
+			OrganizationalUnit: []string{info.OrganizationalUnit},
+			CommonName:         info.CommonName,
 		},
 		NotBefore:             time.Now().Add(-10 * time.Minute),
 		NotAfter:              time.Now().AddDate(validYears, 0, 0),
@@ -370,11 +368,9 @@ func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains [
 
 	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 
-	// 转换 CommonName 为 ASCII/Punycode（如果包含了中文）
 	commonName := "localhost"
 	if len(domains) > 0 && domains[0] != "" {
-		asciiCN, err := idna.ToASCII(domains[0])
-		if err == nil {
+		if asciiCN, err := idna.ToASCII(domains[0]); err == nil {
 			commonName = asciiCN
 		} else {
 			commonName = domains[0]
@@ -386,32 +382,26 @@ func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains [
 		Subject: pkix.Name{
 			CommonName: commonName,
 		},
-		NotBefore:             time.Now().Add(-10 * time.Minute),
+		NotBefore: time.Now().Add(-10 * time.Minute),
+		// 🛠️ 关键修改：服务端证书遵循现代浏览器标准，限制有效期为 365 天（避免 ERR_CERT_VALIDITY_TOO_LONG）
 		NotAfter:              time.Now().AddDate(1, 0, 0),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 
-	// 处理 SAN 域名与 IP
 	for _, domain := range domains {
 		if domain == "" {
 			continue
 		}
-
-		// 1. 尝试解析为 IP
 		if ip := net.ParseIP(domain); ip != nil {
 			template.IPAddresses = append(template.IPAddresses, ip)
 			continue
 		}
-
-		// 2. 将中文域名转为 Punycode ASCII 格式
 		asciiDomain, err := idna.ToASCII(domain)
 		if err != nil {
-			// 如果转码失败，仍保留原域名尝试处理
 			asciiDomain = domain
 		}
-
 		template.DNSNames = append(template.DNSNames, asciiDomain)
 	}
 
@@ -432,7 +422,7 @@ func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains [
 	return certPEM, keyPEM, err
 }
 
-// ===== PEM 格式转换与 Zip 编码工具 =====
+// ===== 工具函数 =====
 
 func encodeToPEM(blockType string, rawData []byte) string {
 	var buf bytes.Buffer
@@ -441,47 +431,30 @@ func encodeToPEM(blockType string, rawData []byte) string {
 }
 
 func encodePrivateKeyToPEM(key crypto.Signer) (string, error) {
-	var rawBytes []byte
-	var blockType string
-	var err error
-
-	switch k := key.(type) {
-	case *rsa.PrivateKey:
-		rawBytes = x509.MarshalPKCS1PrivateKey(k)
-		blockType = "RSA PRIVATE KEY"
-	case *ecdsa.PrivateKey:
-		rawBytes, err = x509.MarshalECPrivateKey(k)
-		if err != nil {
-			return "", err
-		}
-		blockType = "EC PRIVATE KEY"
-	default:
-		rawBytes, err = x509.MarshalPKCS8PrivateKey(key)
-		if err != nil {
-			return "", err
-		}
-		blockType = "PRIVATE KEY"
+	// 🛠️ 统一采用标准的 PKCS#8 格式导出私钥
+	rawBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return "", err
 	}
-
-	return encodeToPEM(blockType, rawBytes), nil
+	return encodeToPEM("PRIVATE KEY", rawBytes), nil
 }
 
-func addFileToZip(zw *zip.Writer, filename string, content []byte) {
+func addFileToZip(zw *zip.Writer, filename string, content []byte) error {
 	f, err := zw.Create(filename)
 	if err != nil {
-		return
+		return err
 	}
-	f.Write(content)
+	_, err = f.Write(content)
+	return err
 }
 
-// CORS 中间件
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, Authorization")
 		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
+			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
 		c.Next()
