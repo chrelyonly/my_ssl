@@ -1,216 +1,365 @@
 package main
 
 import (
-	"crypto/md5"
+	"archive/zip"
+	"bytes"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"encoding/pem"
-	"io/ioutil"
-	"log"
+	"fmt"
 	"math/big"
 	"net"
-	"os"
+	"net/http"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
-const (
-	RSABitsSize        = 4096
-	CACertFilename     = "build/ca.pem"
-	CAKeyFilename      = "build/ca.key"
-	ServerCertFilename = "build/server.pem"
-	ServerKeyFilename  = "build/server.key"
-	ConfigFilename     = "build/config.json" // 配置文件名
-)
+// ===== 请求与响应数据结构定义 =====
 
-// 配置文件的结构体
-type Config struct {
-	IPs     []string `json:"ips"`     // 存储IP地址
-	Domains []string `json:"domains"` // 存储域名
-	CA      CAConfig `json:"ca"`      // 存储CA配置
+type KeySpec struct {
+	Type string `json:"type"` // "RSA" | "ECDSA"
+	Size int    `json:"size"` // RSA: 2048, 3072, 4096 | ECDSA: 256, 384, 521
 }
 
-type CAConfig struct {
-	Country            string `json:"country"`            // 国家
-	Province           string `json:"province"`           // 省份
-	Organization       string `json:"organization"`       // 组织
-	OrganizationalUnit string `json:"organizationalUnit"` // 组织单位
-	CommonName         string `json:"commonName"`         // 公共名称
-	ValidityYears      int    `json:"validityYears"`      // 有效期（年）
+type Targets struct {
+	CACert     bool `json:"caCert"`
+	CAKey      bool `json:"caKey"`
+	ServerCert bool `json:"serverCert"`
+	ServerKey  bool `json:"serverKey"`
 }
 
-// 生成RSA私钥
-func GenRsaPK(size int) (*rsa.PrivateKey, error) {
-	return rsa.GenerateKey(rand.Reader, size)
+type CAInfo struct {
+	Country            string `json:"country"`
+	Province           string `json:"province"`
+	Organization       string `json:"organization"`
+	OrganizationalUnit string `json:"organizationalUnit"`
+	CommonName         string `json:"commonName"`
+	ValidityYears      int    `json:"validityYears"`
 }
 
-// 生成并保存PEM格式文件
-func savePEM(filename string, blockType string, bytes []byte) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	return pem.Encode(file, &pem.Block{Type: blockType, Bytes: bytes})
+type GenerateRequest struct {
+	CAMode   string   `json:"caMode"`   // "preset" | "custom"
+	PresetID string   `json:"presetId"` // 预设 CA ID
+	KeySpec  KeySpec  `json:"keySpec"`
+	Targets  Targets  `json:"targets"`
+	CA       CAInfo   `json:"ca"`
+	Domains  []string `json:"domains"`
+	IPs      []string `json:"ips"`
 }
 
-// 从JSON文件加载配置
-func loadConfig(filename string) (*Config, error) {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-
-	return &config, nil
+type PresetCA struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
-// 生成CA证书和私钥
-func generateCA(caConfig CAConfig) (*x509.Certificate, *rsa.PrivateKey, error) {
-	key, err := GenRsaPK(RSABitsSize)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// CA证书信息
-	caInfo := pkix.Name{
-		Country:            []string{caConfig.Country},
-		Province:           []string{caConfig.Province},
-		Organization:       []string{caConfig.Organization},
-		OrganizationalUnit: []string{caConfig.OrganizationalUnit},
-		CommonName:         caConfig.CommonName,
-	}
-
-	// CA证书配置
-	ca := &x509.Certificate{
-		SerialNumber:          big.NewInt(time.Now().UnixNano()),
-		Subject:               caInfo,
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(caConfig.ValidityYears, 0, 0), // 使用配置中的有效期
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		SubjectKeyId:          md5.New().Sum([]byte(time.Now().String())),
-	}
-
-	// 使用CA私钥自签名生成证书
-	certBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &key.PublicKey, key)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// 保存CA证书和私钥
-	if err := savePEM(CACertFilename, "CERTIFICATE", certBytes); err != nil {
-		return nil, nil, err
-	}
-	if err := savePEM(CAKeyFilename, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(key)); err != nil {
-		return nil, nil, err
-	}
-
-	return ca, key, nil
+// 内存中缓存的内置 CA 结构
+type InternalCA struct {
+	Cert    *x509.Certificate
+	Key     crypto.Signer
+	CertPEM string
+	KeyPEM  string
 }
 
-// 生成服务器证书
-func generateServerCert(caConfig CAConfig, ca *x509.Certificate, caKey *rsa.PrivateKey, config *Config) error {
-	key, err := GenRsaPK(RSABitsSize)
-	if err != nil {
-		return err
-	}
-	// 服务器证书信息
-	serverInfo := pkix.Name{
-		Country:            []string{caConfig.Country},
-		Province:           []string{caConfig.Province},
-		Organization:       []string{caConfig.Organization},
-		OrganizationalUnit: []string{caConfig.OrganizationalUnit},
-		CommonName:         caConfig.CommonName,
-	}
+var presetCAMap = make(map[string]*InternalCA)
 
-	// 服务器证书配置
-	serverCert := &x509.Certificate{
-		SerialNumber:   big.NewInt(time.Now().UnixNano()),
-		Subject:        serverInfo,
-		NotBefore:      time.Now(),
-		NotAfter:       time.Now().AddDate(caConfig.ValidityYears, 0, 0), // 1年有效期
-		KeyUsage:       x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		AuthorityKeyId: ca.SubjectKeyId,
-	}
-
-	// 将配置中的 IP 地址添加到服务器证书
-	for _, ip := range config.IPs {
-		serverCert.IPAddresses = append(serverCert.IPAddresses, net.ParseIP(ip))
-	}
-
-	// 将配置中的域名添加到服务器证书
-	for _, domain := range config.Domains {
-		serverCert.DNSNames = append(serverCert.DNSNames, domain)
-	}
-
-	// 使用CA签发服务器证书
-	certBytes, err := x509.CreateCertificate(rand.Reader, serverCert, ca, &key.PublicKey, caKey)
-	if err != nil {
-		return err
-	}
-
-	// 保存服务器证书和私钥
-	if err := savePEM(ServerCertFilename, "CERTIFICATE", certBytes); err != nil {
-		return err
-	}
-	if err := savePEM(ServerKeyFilename, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(key)); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// LoadCA 从文件加载CA证书和私钥
-func LoadCA(certFile, keyFile string) (*x509.Certificate, *rsa.PrivateKey) {
-	caData := loadPEMData(certFile)
-	ca, err := x509.ParseCertificate(caData.Bytes)
-	if err != nil {
-		log.Fatalf("解析CA证书失败: %v", err)
-	}
-
-	keyData := loadPEMData(keyFile)
-	caKey, err := x509.ParsePKCS1PrivateKey(keyData.Bytes)
-	if err != nil {
-		log.Fatalf("解析CA私钥失败: %v", err)
-	}
-	return ca, caKey
-}
-
-// loadPEMData 从文件加载PEM数据
-func loadPEMData(filename string) *pem.Block {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		log.Fatalf("读取文件 %s 失败: %v", filename, err)
-	}
-	block, _ := pem.Decode(data)
-	return block
-}
+// ===== 主入口函数 =====
 
 func main() {
-	// 读取配置文件
-	config, err := loadConfig(ConfigFilename)
+	// 初始化内置预设 CA
+	initPresetCAs()
+
+	r := gin.Default()
+
+	// 跨域中间件
+	r.Use(corsMiddleware())
+
+	// 1. 获取内置预设 CA 列表
+	r.GET("/api/presets", func(c *gin.Context) {
+		presets := []PresetCA{
+			{ID: "1", Name: "Internal Default CA (2026)"},
+			{ID: "2", Name: "K8s Cluster Root CA"},
+		}
+		c.JSON(http.StatusOK, presets)
+	})
+
+	// 2. 证书生成并打包 Zip 接口
+	r.POST("/generate", handleGenerateCerts)
+
+	fmt.Println("🚀 PKI 证书签发后端已启动于 :8080...")
+	r.Run(":8080")
+}
+
+// ===== 核心业务逻辑实现 =====
+
+func handleGenerateCerts(c *gin.Context) {
+	var req GenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数解析失败: " + err.Error()})
+		return
+	}
+
+	var caCert *x509.Certificate
+	var caKey crypto.Signer
+	var caCertPEM, caKeyPEM string
+	var err error
+
+	// Step 1: 获取或生成 CA 根证书
+	if req.CAMode == "preset" {
+		preset, ok := presetCAMap[req.PresetID]
+		if !ok {
+			preset = presetCAMap["1"]
+		}
+		caCert = preset.Cert
+		caKey = preset.Key
+		caCertPEM = preset.CertPEM
+		caKeyPEM = preset.KeyPEM
+	} else {
+		// 自动生成全新自签名 CA
+		caCert, caKey, caCertPEM, caKeyPEM, err = generateCustomCA(req.CA, req.KeySpec)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "自定义 CA 生成失败: " + err.Error()})
+			return
+		}
+	}
+
+	// Step 2: 生成服务端私钥与证书（使用 CA 进行签发）
+	serverCertPEM, serverKeyPEM, err := generateServerCert(caCert, caKey, req.Domains, req.IPs, req.KeySpec)
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务端证书签发失败: " + err.Error()})
+		return
 	}
 
-	// 使用配置文件中的 CA 配置生成 CA 证书和私钥
-	//ca, caKey, _ := generateCA(config.CA)
-	ca, caKey := LoadCA(CACertFilename, CAKeyFilename)
+	// Step 3: 根据前端勾选的 Targets 组装 Zip 压缩包
+	zipBuf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(zipBuf)
 
-	// 使用配置文件生成服务器证书
-	if err := generateServerCert(config.CA, ca, caKey, config); err != nil {
-		log.Fatalf("生成服务器证书失败: %v", err)
+	if req.Targets.CACert && caCertPEM != "" {
+		addFileToZip(zipWriter, "ca.pem", []byte(caCertPEM))
 	}
-	log.Println("服务器证书和私钥生成成功")
+	if req.Targets.CAKey && caKeyPEM != "" {
+		addFileToZip(zipWriter, "ca.key", []byte(caKeyPEM))
+	}
+	if req.Targets.ServerCert && serverCertPEM != "" {
+		addFileToZip(zipWriter, "server.pem", []byte(serverCertPEM))
+	}
+	if req.Targets.ServerKey && serverKeyPEM != "" {
+		addFileToZip(zipWriter, "server.key", []byte(serverKeyPEM))
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "打包 ZIP 失败: " + err.Error()})
+		return
+	}
+
+	// Step 4: 返回文件流供前端下载
+	c.Header("Content-Disposition", "attachment; filename=certs.zip")
+	c.Header("Content-Type", "application/zip")
+	c.Data(http.StatusOK, "application/zip", zipBuf.Bytes())
+}
+
+// ===== PKI 密钥与证书生成辅助函数 =====
+
+// 生成密钥对 (RSA / ECDSA)
+func generatePrivateKey(spec KeySpec) (crypto.Signer, error) {
+	switch spec.Type {
+	case "ECDSA":
+		var curve elliptic.Curve
+		switch spec.Size {
+		case 384:
+			curve = elliptic.P384()
+		case 521:
+			curve = elliptic.P521()
+		default:
+			curve = elliptic.P256()
+		}
+		return ecdsa.GenerateKey(curve, rand.Reader)
+	case "RSA":
+		fallthrough
+	default:
+		bits := spec.Size
+		if bits < 2048 {
+			bits = 2048
+		}
+		return rsa.GenerateKey(rand.Reader, bits)
+	}
+}
+
+// 生成自定义 CA
+func generateCustomCA(info CAInfo, spec KeySpec) (*x509.Certificate, crypto.Signer, string, string, error) {
+	key, err := generatePrivateKey(spec)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+
+	validYears := info.ValidityYears
+	if validYears <= 0 {
+		validYears = 5
+	}
+
+	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Country:      []string{info.Country},
+			Organization: []string{info.Organization},
+			CommonName:   info.CommonName,
+		},
+		NotBefore:             time.Now().Add(-10 * time.Minute),
+		NotAfter:              time.Now().AddDate(validYears, 0, 0),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+
+	parsedCert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+
+	certPEM := encodeToPEM("CERTIFICATE", certBytes)
+	keyPEM, err := encodePrivateKeyToPEM(key)
+
+	return parsedCert, key, certPEM, keyPEM, err
+}
+
+// 签发服务端证书
+func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains []string, ips []string, spec KeySpec) (string, string, error) {
+	key, err := generatePrivateKey(spec)
+	if err != nil {
+		return "", "", err
+	}
+
+	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+
+	commonName := "localhost"
+	if len(domains) > 0 && domains[0] != "" {
+		commonName = domains[0]
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: commonName,
+		},
+		NotBefore:             time.Now().Add(-10 * time.Minute),
+		NotAfter:              time.Now().AddDate(1, 0, 0), // 服务端证书默认 1 年有效期
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+
+	// 处理 SAN (DNS 域名与 IP)
+	for _, domain := range domains {
+		if domain == "" {
+			continue
+		}
+		if ip := net.ParseIP(domain); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, domain)
+		}
+	}
+	for _, ipStr := range ips {
+		if ip := net.ParseIP(ipStr); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		}
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, key.Public(), caKey)
+	if err != nil {
+		return "", "", err
+	}
+
+	certPEM := encodeToPEM("CERTIFICATE", certBytes)
+	keyPEM, err := encodePrivateKeyToPEM(key)
+
+	return certPEM, keyPEM, err
+}
+
+// ===== PEM 格式转换与 Zip 编码工具 =====
+
+func encodeToPEM(blockType string, rawData []byte) string {
+	var buf bytes.Buffer
+	pem.Encode(&buf, &pem.Block{Type: blockType, Bytes: rawData})
+	return buf.String()
+}
+
+func encodePrivateKeyToPEM(key crypto.Signer) (string, error) {
+	var rawBytes []byte
+	var blockType string
+	var err error
+
+	switch k := key.(type) {
+	case *rsa.PrivateKey:
+		rawBytes = x509.MarshalPKCS1PrivateKey(k)
+		blockType = "RSA PRIVATE KEY"
+	case *ecdsa.PrivateKey:
+		rawBytes, err = x509.MarshalECPrivateKey(k)
+		if err != nil {
+			return "", err
+		}
+		blockType = "EC PRIVATE KEY"
+	default:
+		rawBytes, err = x509.MarshalPKCS8PrivateKey(key)
+		if err != nil {
+			return "", err
+		}
+		blockType = "PRIVATE KEY"
+	}
+
+	return encodeToPEM(blockType, rawBytes), nil
+}
+
+func addFileToZip(zw *zip.Writer, filename string, content []byte) {
+	f, err := zw.Create(filename)
+	if err != nil {
+		return
+	}
+	f.Write(content)
+}
+
+// ===== 预设 CA 初始化 =====
+
+func initPresetCAs() {
+	rsaSpec := KeySpec{Type: "RSA", Size: 2048}
+	ca1Cert, ca1Key, ca1CertPEM, ca1KeyPEM, _ := generateCustomCA(CAInfo{
+		Country:       "CN",
+		Organization:  "DevCorp Ops",
+		CommonName:    "Internal Default CA (2026)",
+		ValidityYears: 10,
+	}, rsaSpec)
+	presetCAMap["1"] = &InternalCA{Cert: ca1Cert, Key: ca1Key, CertPEM: ca1CertPEM, KeyPEM: ca1KeyPEM}
+
+	ca2Cert, ca2Key, ca2CertPEM, ca2KeyPEM, _ := generateCustomCA(CAInfo{
+		Country:       "US",
+		Organization:  "Kubernetes Local",
+		CommonName:    "K8s Cluster Root CA",
+		ValidityYears: 10,
+	}, rsaSpec)
+	presetCAMap["2"] = &InternalCA{Cert: ca2Cert, Key: ca2Key, CertPEM: ca2CertPEM, KeyPEM: ca2KeyPEM}
+}
+
+// CORS 中间件
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, Authorization")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	}
 }
