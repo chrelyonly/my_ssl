@@ -226,8 +226,8 @@ import { Download, Plus, Delete } from '@element-plus/icons-vue'
 
 const loading = ref(false)
 const presetCAList = ref([
-  { id: '1', name: 'Internal Default CA (2026)' },
-  { id: '2', name: 'K8s Cluster Root CA' }
+  { id: '1', name: 'chrelyonly专用证书' },
+  { id: '2', name: '访客通用证书' }
 ])
 
 const targetList = {
@@ -270,17 +270,6 @@ const handleAlgChange = (val) => {
   }
 }
 
-onMounted(async () => {
-  try {
-    const res = await axios.get('/api/presets')
-    if (res.data && res.data.length > 0) {
-      presetCAList.value = res.data
-      form.presetId = presetCAList.value[0].id
-    }
-  } catch (err) {
-    console.warn('后端接口暂未返回，已启用本地预设数据')
-  }
-})
 
 const handleGenerate = async () => {
   loading.value = true

@@ -15,9 +15,12 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/idna"
 )
 
 // ===== 请求与响应数据结构定义 =====
@@ -45,7 +48,7 @@ type CAInfo struct {
 
 type GenerateRequest struct {
 	CAMode   string   `json:"caMode"`   // "preset" | "custom"
-	PresetID string   `json:"presetId"` // 预设 CA ID
+	PresetID string   `json:"presetId"` // 预设 CA ID: "1" 或 "2" 等
 	KeySpec  KeySpec  `json:"keySpec"`
 	Targets  Targets  `json:"targets"`
 	CA       CAInfo   `json:"ca"`
@@ -58,7 +61,7 @@ type PresetCA struct {
 	Name string `json:"name"`
 }
 
-// 内存中缓存的内置 CA 结构
+// 内存中缓存的内置/本地 CA 结构
 type InternalCA struct {
 	Cert    *x509.Certificate
 	Key     crypto.Signer
@@ -71,19 +74,19 @@ var presetCAMap = make(map[string]*InternalCA)
 // ===== 主入口函数 =====
 
 func main() {
-	// 初始化内置预设 CA
-	initPresetCAs()
+	// 初始化从 template/{id}/ 目录加载预设 CA 证书
+	initPresetCAsFromTemplate()
 
 	r := gin.Default()
 
 	// 跨域中间件
 	r.Use(corsMiddleware())
 
-	// 1. 获取内置预设 CA 列表
+	// 1. 获取预设 CA 列表接口
 	r.GET("/api/presets", func(c *gin.Context) {
 		presets := []PresetCA{
-			{ID: "1", Name: "Internal Default CA (2026)"},
-			{ID: "2", Name: "K8s Cluster Root CA"},
+			{ID: "1", Name: "chrelyonly专用证书"},
+			{ID: "2", Name: "访客通用证书"},
 		}
 		c.JSON(http.StatusOK, presets)
 	})
@@ -112,8 +115,9 @@ func handleGenerateCerts(c *gin.Context) {
 	// Step 1: 获取或生成 CA 根证书
 	if req.CAMode == "preset" {
 		preset, ok := presetCAMap[req.PresetID]
-		if !ok {
-			preset = presetCAMap["1"]
+		if !ok || preset == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("选中的预设 CA (%s) 未找到或未成功加载 template/%s 目录下的证书", req.PresetID, req.PresetID)})
+			return
 		}
 		caCert = preset.Cert
 		caKey = preset.Key
@@ -128,7 +132,7 @@ func handleGenerateCerts(c *gin.Context) {
 		}
 	}
 
-	// Step 2: 生成服务端私钥与证书（使用 CA 进行签发）
+	// Step 2: 生成服务端私钥与证书（使用选定的 CA 进行签发）
 	serverCertPEM, serverKeyPEM, err := generateServerCert(caCert, caKey, req.Domains, req.IPs, req.KeySpec)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "服务端证书签发失败: " + err.Error()})
@@ -163,9 +167,106 @@ func handleGenerateCerts(c *gin.Context) {
 	c.Data(http.StatusOK, "application/zip", zipBuf.Bytes())
 }
 
+// ===== 本地 template 目录 CA 证书文件读取加载 =====
+
+func initPresetCAsFromTemplate() {
+	presets := []struct {
+		id   string
+		name string
+	}{
+		{id: "1", name: "chrelyonly专用证书"},
+		{id: "2", name: "访客通用证书"},
+	}
+
+	execDir, err := os.Getwd()
+	if err != nil {
+		execDir = "."
+	}
+
+	for _, p := range presets {
+		// 读取路径类似: template/1/ca.pem 和 template/1/ca.key
+		targetDir := filepath.Join(execDir, "template", p.id)
+
+		certPath := findCertFile(targetDir)
+		keyPath := filepath.Join(targetDir, "ca.key")
+
+		if certPath == "" {
+			fmt.Printf("⚠️ 警告: 预设 CA [%s - %s] 未能找到证书文件 (%s/ca.pem)\n", p.id, p.name, targetDir)
+			continue
+		}
+
+		ca, err := loadCAFromDisk(certPath, keyPath)
+		if err != nil {
+			fmt.Printf("⚠️ 警告: 无法加载预设 CA [%s - %s]: %v\n", p.id, p.name, err)
+			continue
+		}
+
+		presetCAMap[p.id] = ca
+		fmt.Printf("✅ 成功从 [%s] 加载预设 CA [%s - %s]\n", certPath, p.id, p.name)
+	}
+}
+
+// 寻找 template/{id} 目录下可能存在的证书文件名 (ca.pem / ca.crt / ca.cer)
+func findCertFile(dir string) string {
+	candidates := []string{"ca.pem", "ca.crt", "ca.cer"}
+	for _, name := range candidates {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// 从磁盘读取并解析 PEM 格式的证书和私钥
+func loadCAFromDisk(certPath, keyPath string) (*InternalCA, error) {
+	certBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取证书文件失败: %w", err)
+	}
+
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取私钥文件失败: %w", err)
+	}
+
+	// 解析证书
+	certBlock, _ := pem.Decode(certBytes)
+	if certBlock == nil {
+		return nil, fmt.Errorf("证书 PEM 解析失败")
+	}
+	cert, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("解析 x509 证书失败: %w", err)
+	}
+
+	// 解析私钥 (支持 PKCS1, PKCS8, EC)
+	keyBlock, _ := pem.Decode(keyBytes)
+	if keyBlock == nil {
+		return nil, fmt.Errorf("私钥 PEM 解析失败")
+	}
+
+	var key crypto.Signer
+	if parsedKey, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes); err == nil {
+		key = parsedKey
+	} else if parsedKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes); err == nil {
+		key = parsedKey.(crypto.Signer)
+	} else if parsedKey, err := x509.ParseECPrivateKey(keyBlock.Bytes); err == nil {
+		key = parsedKey
+	} else {
+		return nil, fmt.Errorf("不支持的私钥格式")
+	}
+
+	return &InternalCA{
+		Cert:    cert,
+		Key:     key,
+		CertPEM: string(certBytes),
+		KeyPEM:  string(keyBytes),
+	}, nil
+}
+
 // ===== PKI 密钥与证书生成辅助函数 =====
 
-// 生成密钥对 (RSA / ECDSA)
 func generatePrivateKey(spec KeySpec) (crypto.Signer, error) {
 	switch spec.Type {
 	case "ECDSA":
@@ -190,7 +291,6 @@ func generatePrivateKey(spec KeySpec) (crypto.Signer, error) {
 	}
 }
 
-// 生成自定义 CA
 func generateCustomCA(info CAInfo, spec KeySpec) (*x509.Certificate, crypto.Signer, string, string, error) {
 	key, err := generatePrivateKey(spec)
 	if err != nil {
@@ -233,7 +333,6 @@ func generateCustomCA(info CAInfo, spec KeySpec) (*x509.Certificate, crypto.Sign
 	return parsedCert, key, certPEM, keyPEM, err
 }
 
-// 签发服务端证书
 func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains []string, ips []string, spec KeySpec) (string, string, error) {
 	key, err := generatePrivateKey(spec)
 	if err != nil {
@@ -242,9 +341,15 @@ func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains [
 
 	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 
+	// 转换 CommonName 为 ASCII/Punycode（如果包含了中文）
 	commonName := "localhost"
 	if len(domains) > 0 && domains[0] != "" {
-		commonName = domains[0]
+		asciiCN, err := idna.ToASCII(domains[0])
+		if err == nil {
+			commonName = asciiCN
+		} else {
+			commonName = domains[0]
+		}
 	}
 
 	template := &x509.Certificate{
@@ -253,23 +358,34 @@ func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains [
 			CommonName: commonName,
 		},
 		NotBefore:             time.Now().Add(-10 * time.Minute),
-		NotAfter:              time.Now().AddDate(1, 0, 0), // 服务端证书默认 1 年有效期
+		NotAfter:              time.Now().AddDate(1, 0, 0),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 
-	// 处理 SAN (DNS 域名与 IP)
+	// 处理 SAN 域名与 IP
 	for _, domain := range domains {
 		if domain == "" {
 			continue
 		}
+
+		// 1. 尝试解析为 IP
 		if ip := net.ParseIP(domain); ip != nil {
 			template.IPAddresses = append(template.IPAddresses, ip)
-		} else {
-			template.DNSNames = append(template.DNSNames, domain)
+			continue
 		}
+
+		// 2. 将中文域名转为 Punycode ASCII 格式
+		asciiDomain, err := idna.ToASCII(domain)
+		if err != nil {
+			// 如果转码失败，仍保留原域名尝试处理
+			asciiDomain = domain
+		}
+
+		template.DNSNames = append(template.DNSNames, asciiDomain)
 	}
+
 	for _, ipStr := range ips {
 		if ip := net.ParseIP(ipStr); ip != nil {
 			template.IPAddresses = append(template.IPAddresses, ip)
@@ -327,27 +443,6 @@ func addFileToZip(zw *zip.Writer, filename string, content []byte) {
 		return
 	}
 	f.Write(content)
-}
-
-// ===== 预设 CA 初始化 =====
-
-func initPresetCAs() {
-	rsaSpec := KeySpec{Type: "RSA", Size: 2048}
-	ca1Cert, ca1Key, ca1CertPEM, ca1KeyPEM, _ := generateCustomCA(CAInfo{
-		Country:       "CN",
-		Organization:  "DevCorp Ops",
-		CommonName:    "Internal Default CA (2026)",
-		ValidityYears: 10,
-	}, rsaSpec)
-	presetCAMap["1"] = &InternalCA{Cert: ca1Cert, Key: ca1Key, CertPEM: ca1CertPEM, KeyPEM: ca1KeyPEM}
-
-	ca2Cert, ca2Key, ca2CertPEM, ca2KeyPEM, _ := generateCustomCA(CAInfo{
-		Country:       "US",
-		Organization:  "Kubernetes Local",
-		CommonName:    "K8s Cluster Root CA",
-		ValidityYears: 10,
-	}, rsaSpec)
-	presetCAMap["2"] = &InternalCA{Cert: ca2Cert, Key: ca2Key, CertPEM: ca2CertPEM, KeyPEM: ca2KeyPEM}
 }
 
 // CORS 中间件

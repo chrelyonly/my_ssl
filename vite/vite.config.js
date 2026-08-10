@@ -22,12 +22,12 @@ export default defineConfig({
   server: {
     allowedHosts: true,
     proxy: {
-      '/api/': {
-        // target: 'http://localhost:8078',
-        target: 'https://music-app.chrelyonly.cn/api/',
+      '/generate': {
+        target: 'http://localhost:8080/generate',
+        // target: 'https://music-app.chrelyonly.cn/api/',
         changeOrigin: true,
         ws: true,
-        rewrite: path => path.replace(/^\/api/, ''),
+        rewrite: path => path.replace(/^\/generate/, ''),
       },
     },
   },
