@@ -207,13 +207,14 @@ func initPresetCAsFromTemplate() {
 		{id: "2", name: "访客通用证书"},
 	}
 
-	execDir, err := os.Getwd()
-	if err != nil {
-		execDir = "."
+	// 🛠️ 优化：优先获取可执行文件真实路径，避免 cd 到其他目录运行时读取失败
+	baseDir := "."
+	if execPath, err := os.Executable(); err == nil {
+		baseDir = filepath.Dir(execPath)
 	}
 
 	for _, p := range presets {
-		targetDir := filepath.Join(execDir, "template", p.id)
+		targetDir := filepath.Join(baseDir, "template", p.id)
 		certPath := findCertFile(targetDir)
 		keyPath := filepath.Join(targetDir, "ca.key")
 
@@ -293,7 +294,7 @@ func loadCAFromDisk(certPath, keyPath string) (*InternalCA, error) {
 // ===== PKI 密钥与证书生成辅助函数 =====
 
 func generatePrivateKey(spec KeySpec) (crypto.Signer, error) {
-	switch spec.Type {
+	switch strings.ToUpper(spec.Type) {
 	case "ECDSA":
 		var curve elliptic.Curve
 		switch spec.Size {
@@ -327,7 +328,13 @@ func generateCustomCA(info CAInfo, spec KeySpec) (*x509.Certificate, crypto.Sign
 		validYears = 5
 	}
 
-	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	// 🛠️ 修复：安全生成 SerialNumber，防止 nil 指针崩溃
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, "", "", fmt.Errorf("生成证书序列号失败: %w", err)
+	}
+
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
@@ -366,49 +373,73 @@ func generateServerCert(caCert *x509.Certificate, caKey crypto.Signer, domains [
 		return "", "", err
 	}
 
-	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	// 🛠️ 修复：安全生成 SerialNumber
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return "", "", fmt.Errorf("生成证书序列号失败: %w", err)
+	}
 
-	commonName := "localhost"
-	if len(domains) > 0 && domains[0] != "" {
-		if asciiCN, err := idna.ToASCII(domains[0]); err == nil {
-			commonName = asciiCN
-		} else {
-			commonName = domains[0]
-		}
+	// 🛠️ 优化 KeyUsage：仅针对 RSA 添加 KeyEncipherment
+	keyUsage := x509.KeyUsageDigitalSignature
+	if strings.ToUpper(spec.Type) == "RSA" {
+		keyUsage |= x509.KeyUsageKeyEncipherment
 	}
 
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			CommonName: commonName,
+			CommonName: "localhost",
 		},
-		NotBefore: time.Now().Add(-10 * time.Minute),
-		// 🛠️ 关键修改：服务端证书遵循现代浏览器标准，限制有效期为 365 天（避免 ERR_CERT_VALIDITY_TOO_LONG）
-		NotAfter:              time.Now().AddDate(1, 0, 0),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		NotBefore:             time.Now().Add(-10 * time.Minute),
+		NotAfter:              time.Now().AddDate(1, 0, 0), // 遵从 Modern TLS 标准，限制 1 年有效期
+		KeyUsage:              keyUsage,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 
+	dnsMap := make(map[string]bool)
+	ipMap := make(map[string]bool)
+
+	// 解析与清洗 domains
 	for _, domain := range domains {
+		domain = strings.TrimSpace(domain)
 		if domain == "" {
 			continue
 		}
 		if ip := net.ParseIP(domain); ip != nil {
-			template.IPAddresses = append(template.IPAddresses, ip)
+			if !ipMap[ip.String()] {
+				template.IPAddresses = append(template.IPAddresses, ip)
+				ipMap[ip.String()] = true
+			}
 			continue
 		}
 		asciiDomain, err := idna.ToASCII(domain)
 		if err != nil {
 			asciiDomain = domain
 		}
-		template.DNSNames = append(template.DNSNames, asciiDomain)
+		if !dnsMap[asciiDomain] {
+			template.DNSNames = append(template.DNSNames, asciiDomain)
+			dnsMap[asciiDomain] = true
+		}
 	}
 
+	// 解析与清洗 ips
 	for _, ipStr := range ips {
+		ipStr = strings.TrimSpace(ipStr)
 		if ip := net.ParseIP(ipStr); ip != nil {
-			template.IPAddresses = append(template.IPAddresses, ip)
+			if !ipMap[ip.String()] {
+				template.IPAddresses = append(template.IPAddresses, ip)
+				ipMap[ip.String()] = true
+			}
 		}
+	}
+
+	// 🛠️ 自动设置合规的 CommonName
+	if len(template.DNSNames) > 0 {
+		template.Subject.CommonName = template.DNSNames[0]
+	} else if len(template.IPAddresses) > 0 {
+		template.Subject.CommonName = template.IPAddresses[0].String()
 	}
 
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, key.Public(), caKey)
@@ -431,7 +462,6 @@ func encodeToPEM(blockType string, rawData []byte) string {
 }
 
 func encodePrivateKeyToPEM(key crypto.Signer) (string, error) {
-	// 🛠️ 统一采用标准的 PKCS#8 格式导出私钥
 	rawBytes, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		return "", err
@@ -453,6 +483,9 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, Authorization")
+		// 🛠️ 关键补充：允许前端读取 Content-Disposition 响应头以获取文件名
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
+
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
