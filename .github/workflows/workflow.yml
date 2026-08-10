@@ -102,8 +102,6 @@ jobs:
             cp "${BASE_NAME}" "$PACKAGE_DIR/"
           fi
 
-          cp ../config.json "$PACKAGE_DIR/config.json"
-
           # 打包
           if [ "${{ matrix.goos }}" = "windows" ]; then
             zip -r "${BASE_NAME}.zip" "$PACKAGE_DIR"
