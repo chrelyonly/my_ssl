@@ -251,12 +251,12 @@ const form = reactive({
     serverKey: true,
   },
   ca: {
-    country: 'CN',
-    province: 'Beijing',
-    organization: 'Dev Team',
-    organizationalUnit: 'SecOps',
-    commonName: 'Internal Root CA',
-    validityYears: 5
+    country: 'chrelyonly',
+    province: 'chrelyonly',
+    organization: 'chrelyonly',
+    organizationalUnit: 'chrelyonly',
+    commonName: 'chrelyonly',
+    validityYears: 100
   },
   domains: ['localhost', '*.cluster.local'],
   ips: ['127.0.0.1']

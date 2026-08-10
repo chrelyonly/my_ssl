@@ -10,13 +10,16 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"embed"
 	"encoding/pem"
 	"fmt"
+	"io/fs"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -71,28 +74,54 @@ type InternalCA struct {
 
 var presetCAMap = make(map[string]*InternalCA)
 
-// ===== 主入口函数 =====
+// 💡 1. 嵌入 public 文件夹（确保 main.go 同级或下级存在 public 目录）
+//
+//go:embed public/*
+var staticFS embed.FS
 
 func main() {
-	// 初始化从 template/{id}/ 目录加载预设 CA 证书
 	initPresetCAsFromTemplate()
 
+	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
-
-	// 跨域中间件
 	r.Use(corsMiddleware())
 
-	// 1. 获取预设 CA 列表接口
-	r.GET("/api/presets", func(c *gin.Context) {
-		presets := []PresetCA{
-			{ID: "1", Name: "chrelyonly专用证书"},
-			{ID: "2", Name: "访客通用证书"},
-		}
-		c.JSON(http.StatusOK, presets)
-	})
-
-	// 2. 证书生成并打包 Zip 接口
+	// ===== 路由配置 =====
 	r.POST("/generate", handleGenerateCerts)
+
+	// ===== 2. 配置静态资源与 SPA 路由适配 =====
+
+	// 提取 staticFS 中的 public 子目录作为根目录
+	subFS, err := fs.Sub(staticFS, "public")
+	if err != nil {
+		panic(fmt.Sprintf("初始化嵌入文件失败: %v", err))
+	}
+
+	// 代理静态文件（如 js, css, images 等）
+	httpFS := http.FS(subFS)
+
+	// 拦截未匹配的路由，返回 index.html 以支持 Vue Router 的 History 模式
+	r.NoRoute(func(c *gin.Context) {
+		path := c.Request.URL.Path
+
+		// 如果请求的是 API 或已有路由，跳过处理
+		if strings.HasPrefix(path, "/generate") {
+			return
+		}
+
+		// 检查请求的文件是否存在于 embed.FS 中
+		f, err := subFS.Open(strings.TrimPrefix(path, "/"))
+		if err == nil {
+			_ = f.Close()
+			// 文件存在，交由 http.FileServer 直接渲染静态资源
+			http.FileServer(httpFS).ServeHTTP(c.Writer, c.Request)
+			return
+		}
+
+		// 文件不存在（例如 Vue 路由页面刷新，如 /dashboard），统一返回 index.html
+		c.Request.URL.Path = "/"
+		http.FileServer(httpFS).ServeHTTP(c.Writer, c.Request)
+	})
 
 	fmt.Println("🚀 PKI 证书签发后端已启动于 :8080...")
 	r.Run(":8080")
