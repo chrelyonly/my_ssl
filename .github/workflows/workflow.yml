@@ -102,10 +102,6 @@ jobs:
             cp "${BASE_NAME}" "$PACKAGE_DIR/"
           fi
 
-          mkdir -p "$PACKAGE_DIR/build"
-          # 拷贝证书文件（来自仓库根目录）
-          cp ../ca.key "$PACKAGE_DIR/build"
-          cp ../ca.pem "$PACKAGE_DIR/build"
           cp ../config.json "$PACKAGE_DIR/config.json"
 
           # 打包
